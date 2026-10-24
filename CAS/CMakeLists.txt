@@ -32,7 +32,7 @@ target_include_directories(CAS
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/Include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/Sorce
+        ${CMAKE_CURRENT_SOURCE_DIR}/Source
 )
 
 # ============================================================
