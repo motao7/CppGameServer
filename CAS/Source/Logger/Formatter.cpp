@@ -241,7 +241,7 @@ template <typename Item>
         {'r', &CreateSimpleFormatItem<ElapsedFormatItem>},        // r 启动至今耗时
         {'c', &CreateSimpleFormatItem<LoggerNameFormatItem>},     // c 日志器名称
         {'t', &CreateSimpleFormatItem<ThreadIdFormatItem>},       // t 线程 ID
-        {'n', &CreateSimpleFormatItem<LineFormatItem>},        // n 换行
+        {'n', &CreateSimpleFormatItem<NewlineFormatItem>},       // n 换行
         {'d', &CreateConfiguredFormatItem<DateTimeFormatItem>},   // d 日期时间（带格式）
         {'u', &CreateSimpleFormatItem<MicrosecondsFormatItem>},   // u 微秒
         {'f', &CreateSimpleFormatItem<FileNameFormatItem>},       // f 文件名
@@ -330,7 +330,11 @@ int Formatter::parse()
 
 Formatter::Formatter(std::string_view pattern) : m_pattern(pattern) 
 {
-    if (!parse())
+    // parse() 的约定是"成功返回 0，失败返回负数"（与 main 习惯一致），
+    // 所以判断条件必须是 != 0。
+    // 注意别写成 if (!parse())：0 取反是 true，那会在**解析成功**时抛异常，
+    // 结果是每一个 Formatter（包括 Logger 构造时那个默认 formatter）都构造失败。
+    if (parse() != 0)
     {
         throw std::invalid_argument("invalid log format, parse failed.");
     }

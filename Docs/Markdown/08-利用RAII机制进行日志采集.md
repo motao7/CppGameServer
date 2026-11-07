@@ -31,7 +31,7 @@
 
 ```mermaid
 flowchart LR
-    A["业务代码<br/>LOG_INFO(logger) &lt;&lt; x"] --> B["前端 LogLine<br/>收集一条日志"]
+    A["业务代码<br/>CAS_LOG_INFO(logger) &lt;&lt; x"] --> B["宏 + 前端 LogLine<br/>收集一条日志"]
     B --> C["Logger::Impl::submit<br/>等级过滤 + 分发"]
     C --> D["Formatter<br/>模式串 → 字节流"]
     D --> E["Appender<br/>stdout / file"]
@@ -48,12 +48,19 @@ flowchart LR
 | 文件 | 可见性 | 职责 |
 |------|--------|------|
 | `CAS/Include/CAS/Logger/LogLine.h` | 公开（但属 `CAS::Detail`） | `LogLine` 类 + `LogPrintf` 声明，全部设计注释在这里 |
-| `CAS/Source/Logger/LogLine.cpp` | 内部 | `Impl` 定义、就地构造/析构、`submit` 组装、`printf` 两趟格式化 |
+| `CAS/Source/Logger/LogLine.cpp` | 内部 | `Impl` 定义、就地构造/析构、`getRecord` 组装、`printf` 单趟格式化 |
+| `CAS/Include/CAS/Logger/Log.h` | 公开 | **业务唯一应该直接用到的入口**：`CAS_LOG_*` / `CAS_LOG_FMT_*` 宏 + `CAS_LOG_ROOT` / `CAS_LOG_NAME` |
+| `Tests/TestLog.cpp` | 测试 | 手动观测程序：5 等级 × 流式/printf、类型拼接、多 sink（见第 6 节） |
 
-命名空间 `CAS::Detail`，头文件保护宏 `CAS_INCLUDE_CAS_LOGGER_LOG_LINE_H`。
+命名空间 `CAS::Detail`（`LogLine` / `LogPrintf`），宏在全局作用域；头文件保护宏分别是
+`CAS_INCLUDE_CAS_LOGGER_LOG_LINE_H` 与 `CAS_INCLUDE_CAS_LOGGER_LOG_H`。
 
-> **现状说明**：`CAS_LOG_*` 系列宏尚未落地（后续再补），目前调用方需要直接写
-> `CAS::Detail::LogLine(logger, level, __LINE__, __FILE__).stream() << ...`。
+**调用方式**（宏已落地，业务代码不再需要手写 `Detail::LogLine`）：
+
+```cpp
+CAS_LOG_INFO(CAS_LOG_NAME("net")) << "connect ok, fd = " << fd;
+CAS_LOG_FMT_WARN(CAS_LOG_ROOT(), "slow query: %s took %d ms", sql, cost_ms);
+```
 
 ---
 
@@ -574,9 +581,188 @@ va_end(arguments_copy);
 | 追加占位符分支 | 需要额外判断 | 天然可以（`LogLine` 已在手） |
 | 结论 | 逻辑更直白 | **热路径更快**，代价是"超长时多写了一遍栈缓冲"（可忽略） |
 
+### 5.5 日志宏 `CAS/Include/CAS/Logger/Log.h`
+
+宏是业务代码**唯一**应该直接用到的入口，两个家族各五个等级：
+
+| 流式（推荐） | printf 风格 |
+|---|---|
+| `CAS_LOG_DEBUG/INFO/WARN/ERROR/FATAL(logger)` | `CAS_LOG_FMT_DEBUG/INFO/WARN/ERROR/FATAL(logger, fmt, ...)` |
+
+```cpp
+CAS_LOG_INFO(CAS_LOG_NAME("net")) << "connect ok, fd = " << fd;
+CAS_LOG_FMT_WARN(CAS_LOG_ROOT(), "slow query: %s took %d ms", sql, cost_ms);
+```
+
+#### 5.5.1 展开形态：`if / else if / else` 三级链
+
+```cpp
+CAS_LOG_INFO(logger) << "fd = " << fd;
+```
+
+展开成：
+
+```cpp
+if (auto cas_log_logger = (logger); !cas_log_logger) {}
+else if (const auto cas_log_level = level; !cas_log_logger->shouldLog(cas_log_level)) {}
+else ::CAS::Detail::LogLine(*cas_log_logger, cas_log_level, __LINE__, __FILE__)
+         .stream() << "fd = " << fd;
+//                  ↑ 用户写的尾巴，正好挂在最后一个 else 上
+```
+
+| 设计点 | 原因 |
+|--------|------|
+| **末尾是 `.stream()`** | 用户的 `<< a << b` 必须能续上去，所以整条链要能当表达式用 |
+| **不能用 `do { } while (0)`** | 块式宏是语句，后面接 `<<` 直接编译错误（见 4.1 原因一） |
+| **每个 `if` 都配 `else`** | 否则 `if (c) LOG << x; else ...` 会出现悬空 `else`，或外层 `if` 只管辖链中第一条语句 |
+| 第一段 `!cas_log_logger` | logger 允许为空（未初始化的全局 logger），此时**静默丢弃**而不是崩 |
+| 第二段 `!shouldLog(level)` | 等级不满足时**连 `LogLine` 都不构造**，`<< ExpensiveToString(obj)` 的开销全部省掉 |
+| `auto cas_log_logger = (logger)` | 同时支持 `LoggerPtr` 与 `Logger*`（`bool` + `operator*`）；拷一份保证整条表达式期间 logger 存活。代价是 `shared_ptr` 一次引用计数增减 |
+
+#### 5.5.2 那个著名的错误写法
+
+```cpp
+// ✗ 错误：第二个分支写成独立的 if
+if (auto cas_log_logger = (logger); !cas_log_logger) {}
+if (const auto cas_log_level = level; !cas_log_logger->shouldLog(cas_log_level)) {}
+else ::CAS::Detail::LogLine(...).stream()
+```
+
+两个致命问题：
+
+1. `if (cond) CAS_LOG_INFO(lg) << x;` 展开后，外层 `if (cond)` **只管辖第一条语句**，
+   日志在 `cond == false` 时照样输出；
+2. logger 为空时第一条 `if` 什么也不做，流程继续走到第二条 → **解引用空指针崩溃**。
+
+#### 5.5.3 `__VA_OPT__` 与"只能补一次逗号"
+
+**`__VA_OPT__` 是什么**：C++20 引入的**预处理运算符**（不是函数、不是宏），语法是 `__VA_OPT__(内容)`：
+
+> `__VA_ARGS__` **非空**时展开成"内容"；为空时展开成**空**（不产生任何 token）。
+
+它只认**当前宏自己的** `__VA_ARGS__`，不能用来判断某个具名参数是否为空。
+
+`CAS_LOG_FMT_INFO(lg, "done")` 没有可变参数，直接写 `, __VA_ARGS__` 会展开成 `..., "done", )` —— 语法错误。C++20 的 `__VA_OPT__(, )` 表示"非空时才展开这个逗号"：
+
+```cpp
+#define CAS_LOG_FMT_LEVEL(logger, level, format, ...) \
+    ... else ::CAS::Detail::LogPrintf(*cas_log_logger, cas_log_level, __LINE__, __FILE__, \
+                                      (format) __VA_OPT__(, ) __VA_ARGS__)
+```
+
+| 调用 | 展开结果 |
+|------|---------|
+| `CAS_LOG_FMT_INFO(lg, "done")` | `LogPrintf(..., ("done"))` |
+| `CAS_LOG_FMT_INFO(lg, "fd=%d", fd)` | `LogPrintf(..., ("fd=%d") , fd)` |
+
+**"空"怎么判定**：只看可变参数里**有没有 token**。传一个"显式空参数"（如 `M(a, )`）产生的 token 数为 0，同样算空 —— 这正是本项目 `CAS_LOG_FMT_INFO(lg, "done")` → `CAS_LOG_FMT_LEVEL((lg), lv, ("done"), )` 仍能正确工作的原因。
+
+**与 GNU 的 `##__VA_ARGS__` 对比**：
+
+| 方案 | 性质 | 说明 |
+|------|------|------|
+| `, ##__VA_ARGS__` | GCC/Clang 扩展（非标准） | 空时"吞掉"前面的逗号，写法隐晦 |
+| `__VA_OPT__(, )` | **C++20 标准** | 显式、可读，内容可以是任意 token（逗号、分号、整条语句） |
+
+**坑**：五个等级的 FMT 宏只做转发，必须写 `(format), __VA_ARGS__`，**不能**再写一遍 `__VA_OPT__(, ) __VA_ARGS__`。否则两层各补一个逗号 → `LogPrintf(..., (format), , arg)` → 两个连续逗号，编译失败。（这是实际踩到的编译错误。）
+
+**兼容性**：需要 `-std=c++20`；GCC 8+、Clang 6+ 已支持，MSVC 需 VS2019 16.5+ 并开启 `/Zc:preprocessor`。纯预处理展开，**零运行时开销**。
+
+#### 5.5.4 为什么没有 `LOG_INFO`（不带 logger 参数）的版本
+
+教师的原始宏文件末尾还有一组应用级快捷方式：
+
+```cpp
+#define LOG_INFO PANS_LOG_INFO(g_logger)   // 依赖某个全局 logger
+```
+
+这属于**游戏/服务器层**的东西——基础库不该知道业务把 logger 存在哪个全局变量里。所以本项目只提供带 `logger` 参数的形式，需要快捷方式时在服务器层再包一层。
+
+#### 5.5.5 注意事项
+
+| 注意 | 说明 |
+|------|------|
+| `__LINE__` / `__FILE__` | 在**宏使用处**展开，所以记录的是业务代码位置 |
+| 不能 `return` / `throw` / `break` | 宏是表达式链，没有自己的作用域块 |
+| 传 `nullptr` | 不崩、也不输出（刻意的降级） |
+| `CAS_LOG_ROOT()` / `CAS_LOG_NAME(name)` | 只是省掉 `::CAS::` 前缀的取值辅助，不是日志器工厂 |
+
 ---
 
-## 6. 问答记录
+## 6. 测试程序 `Tests/TestLog.cpp`
+
+### 6.1 它是什么
+
+**手动观测程序**（不是自动化测试）：把 5 个等级 × 2 种写法、以及各种类型的拼接结果，同时输出到 stdout 与 `<系统临时目录>/test_logger.log`，用来人眼核对格式。不校验文件内容，也不注册到 `ctest`。
+
+### 6.2 覆盖矩阵
+
+| 覆盖点 | 具体写法 | 顺带验证了什么 |
+|--------|---------|---------------|
+| 5 等级 × 流式 | `CAS_LOG_DEBUG..FATAL(logger) << "msg"` | `if / else if / else` 链 + 析构提交 |
+| 5 等级 × printf（零变参） | `CAS_LOG_FMT_DEBUG..FATAL(logger, "msg")` | `__VA_OPT__` 在 `__VA_ARGS__` 为空时不产生多余逗号 |
+| 类型拼接 | `char` / `int` / `const char[]` / `std::string` / `std::string_view`（含 UTF-8） | `ostream` 重载 vs `%s` 的类型要求 |
+| 多 sink | 同一个 logger 挂 stdout + file | 一条日志广播给多个 appender |
+| 应用级快捷方式 | `#define LOG_INFO CAS_LOG_INFO(g_logger)` | 宏里 `g_logger` 在使用处解析，局部变量也能适配 |
+
+### 6.3 为什么写进临时目录
+
+测试不该往仓库里写文件（`.gitignore` 也管不到随机文件名），所以用：
+
+```cpp
+const auto output_path = std::filesystem::temp_directory_path() / "test_logger.log";
+```
+
+开跑前先用一个 `ofstream(trunc)` 把上次残留清空（构造即截断，析构即关闭），保证观察的是本次输出。
+
+### 6.4 一处必须修正的类型问题
+
+老师版本最后一行把 `std::string` / `std::string_view` **直接**传给 `%s`：
+
+```cpp
+LOG_FMT_INFO(..., "msg2: %s msg3: %s", msg2, msg3);   // ✗ UB
+```
+
+- `std::string` 不是 `const char*`，塞进可变参数会把**对象自身的布局**当成指针解释 → 越界读或崩溃；
+- `std::string_view` 不保证以 `'\0'` 结尾，即使 `.data()` 可用也可能读越过末尾。
+
+正确写法：
+
+```cpp
+CAS_LOG_FMT_INFO(logger, "c=%c i=%d msg1: %s msg2: %s msg3: %s",
+                 c, i, msg1, msg2.c_str(), std::string(msg3).c_str());
+```
+
+> `%c` 对应 `char`、`%d` 对应 `int`、`%s` 对应 `const char*`——`printf` 家族**不检查类型**，格式串与参数不匹配就是 UB，这是它天生的短板（想根治可以给 `LogPrintf` 加 `__attribute__((format(printf, 5, 6)))`，见第 10 节）。
+
+### 6.5 运行
+
+```bash
+cmake -S . -B build
+cmake --build build -j$(nproc)
+./build/Tests/TestLog
+cat /tmp/test_logger.log
+```
+
+预期输出（每条 = `时间.微秒 [等级] [test] 消息`）：
+
+```
+2026-11-08 12:00:00.123456 [DEBUG] [test] debug message
+2026-11-08 12:00:00.123789 [INFO] [test] info message
+...
+----------------------------------------
+2026-11-08 12:00:00.124456 [INFO] [test] c=a i=42 msg1: hello msg2: world msg3: pans 磐石
+```
+
+两条 `----------` 是 `std::cout` 直接打印的分隔线，用来在控制台里区分三段。
+
+### 6.6 收尾为什么显式 `flush()`
+
+appender 内部可能带缓冲，进程正常退出不保证刷干净；显式 `logger->flush()` 一次，保证临时目录里的文件内容完整。
+
+---
+
+## 7. 问答记录
 
 > 下面这些问题来自阅读 `LogLine.h` 时的实际卡点，按提问顺序整理。
 
@@ -631,9 +817,71 @@ va_end(arguments_copy);
 - 在奇数地址上 `placement new` 一个要求 16 对齐的 `Impl` 是 **UB**：x86 靠硬件兜着慢慢跑（潜伏）、ARM 原子指令异常、`-O2` 自动向量化后崩、UBSan 立刻报（见 4.3.4 的四层后果）。
 - `alignas(std::max_align_t)` 把它抬到与 `new` 同级的安全对齐，代价是几个 padding 字节；`max_align_t` 覆盖不到 `alignas(32/64)`，由 `static_assert` 编译期拦下。
 
+### Q5 `if (auto lg = (logger); !lg)` 里那个分号是什么？`(logger)` 为什么要加括号？
+
+**① `if (init-statement; condition)` 是 C++17 的"带初始化语句的 if"**
+
+括号里是**两段**，不是两条语句：
+
+```
+if (  声明并初始化 cas_log_logger   ;   条件表达式   )
+        └──── init-statement ────┘     └ condition ┘
+```
+
+中间的 `;` 是这两段的分隔符，不是语句结束。等价写法（但多一层块）：
+
+```cpp
+{
+    auto cas_log_logger = (logger);
+    if (!cas_log_logger) { ... }
+}
+```
+
+好处：`cas_log_logger` 的作用域被限制在**整条 if / else 链**里，出了链自动销毁，不会污染外层作用域——宏塞进调用方函数里正是靠这一点。
+
+**② 判断的是 `!cas_log_logger`，不是 `cas_log_logger`**
+
+`!` 是逻辑非。`std::shared_ptr` 有 `explicit operator bool`，空指针时为 `false`，所以：
+
+```cpp
+!cas_log_logger   // 等价于  (cas_log_logger == nullptr)
+```
+
+于是：
+
+| logger 状态 | 第一个 `if` | 走向 |
+|---|---|---|
+| 空（`nullptr` / 默认构造的 `LoggerPtr`） | 条件为 `true` | 进空块 `{}` → **什么都不做，也不解引用**（安全降级） |
+| 非空、等级被过滤 | 条件为 `false` | `else if` 条件 `!shouldLog(...)` 为 `true` → 进空块 → 结束 |
+| 非空、等级通过 | 两个条件都 `false` | 进 `else` → 构造 `LogLine` → 拼接 → 分号处提交 |
+
+注意 `*cas_log_logger` 又用了一次 `operator*`，从 `shared_ptr<Logger>` 取出 `Logger&`。
+
+**③ 空块 `{}` 不是多余的**
+
+`if` / `else if` 后面必须跟一个语句，`{}` 就是"什么也不做"的占位。它让整条链在语法上是一条完整语句，从而保证 `else` 能挂住用户写的 `<< a << b`（见 5.5.1）。
+
+**④ `(logger)` 的括号：宏卫生（macro hygiene）**
+
+宏是**纯文本替换**，实参原样塞进宏体。如果实参是个复合表达式，而它在使用位置又和相邻运算符优先级不同，就会被拆错：
+
+```cpp
+#define SQUARE(x) x * x
+SQUARE(a + b)   // → a + b * a + b   （错，应为 (a+b)*(a+b)）
+```
+
+日志宏里所有参数都包一层括号，就是为了让实参总作为**一个整体**参与运算：
+
+```cpp
+auto cas_log_logger = (logger);         // 不管传 p、*p、a ? b : c 还是一个逗号表达式
+const auto cas_log_level = (level);
+```
+
+本宏的使用位置是 `= (...)`（赋值右侧），优先级风险本来就低，所以这层括号偏**防御性写法**；真正的价值在于统一风格——**宏参数一律加括号**，审核时不必逐个推理"这里不加行不行"。
+
 ---
 
-## 7. 常见坑
+## 8. 常见坑
 
 | # | 坑 | 说明 |
 |---|----|------|
@@ -651,10 +899,13 @@ va_end(arguments_copy);
 | 12 | 第二趟格式化复用已消费的 `va_list` | 必须 `va_copy` 一份副本，否则读到垃圾参数 |
 | 13 | 在 `LogLine` 里再做等级过滤 | 过滤在 `Logger::Impl::submit`；想在过滤时省掉拼接成本，应该把 `shouldLog` 提到宏入口 |
 | 14 | 以为元信息是"提交时刻"的值 | `m_timestamp` / `m_threadName` 在**构造时**采集，见 4.6 / 5.2 |
+| 15 | 宏里把 `if` 写成两段独立的 `if` | 外层 `if` 只管辖第一条语句 → 日志照打；logger 为空时还会解引用空指针（见 5.5.2） |
+| 16 | 两层宏各补一次 `__VA_OPT__(, )` | 展开成 `LogPrintf(..., (format), , arg)`，两个连续逗号 → 编译失败（见 5.5.3） |
+| 17 | 在宏里声明变量却不用唯一前缀 | 与业务变量同名，宏展开后 `-Wshadow` 报错或行为被改 |
 
 ---
 
-## 8. 知识点清单
+## 9. 知识点清单
 
 - [ ] RAII 三段式：构造收集 → 使用 → 析构提交
 - [ ] 临时对象在"完整表达式"（分号）结束时的销毁时机
@@ -672,13 +923,18 @@ va_end(arguments_copy);
 - [ ] `vsnprintf` 返回值语义（不含 `'\0'` 的所需长度）+ `va_copy` / `va_end` 配对
 - [ ] 单趟写栈缓冲 + 装不下重排，与"先探测长度"方案的取舍
 - [ ] 聚合初始化相比逐字段赋值，为什么能防"漏填字段"
+- [ ] 宏为什么必须展开成表达式：`if / else if / else` 链 vs `do { } while (0)`
+- [ ] 悬空 `else` 与"外层 `if` 只管辖第一条语句"的陷阱
+- [ ] `shouldLog` 前置到宏，为什么能省掉 `<<` 里的昂贵格式化
+- [ ] C++20 `__VA_OPT__`：零可变参数调用，以及"整条链路只能补一次逗号"
 
 ---
 
-## 9. 后续
+## 10. 后续
 
-- 前端宏 `CAS_LOG_DEBUG/INFO/WARN/ERROR/FATAL`（建议用 `for (bool once = ...)` 形态，避免 `if` 的悬空 `else`）
-- 等级过滤前置到宏里，避免不打印的日志仍做字符串拼接
+- ~~前端宏~~ 已完成：`CAS/Include/CAS/Logger/Log.h`（见 5.5），采用 `if / else if / else` 链而非 `for (bool once = ...)`，两者都能避免悬空 `else`，前者还能顺便处理 logger 为空
+- ~~等级过滤前置到宏里~~ 已完成：宏里先 `shouldLog`，不打印时连 `LogLine` 都不构造
+- 给 `LogPrintf` 加 `__attribute__((format(printf, 5, 6)))`，让编译器检查格式串与参数类型是否匹配
 - `GetFiberId()` 接入纤程调度器后改为读取 `thread_local`
 - `LogPrintf` 若要满足规范 7.1 的"对外 `noexcept`"，需整体包 `try/catch`（当前保留了 `bad_alloc` 上抛的可能）
 - 异步日志：`LogRecordView` 的 `string_view` 必须在入队前拷贝成拥有型
